@@ -47,6 +47,8 @@ type Config struct {
 	// TLS contains certificates & CA info for the webserver
 	TLS *TLS `json:"tls,omitempty"`
 
+	AWSALBMutualTLSPassThrough bool `json:"aws_alb_mutual_tls_pass_through"`
+
 	// UseDefaultEngCA overrides default CA to eng
 	UseDefaultEngCA bool `json:"use_default_eng_ca"`
 
@@ -193,6 +195,19 @@ func (c *Config) ExtractServiceTLSConfig(logger *logrus.Logger) (*tls.Config, er
 		return nil, errors.New("tls config is empty - telemetry server is mTLS only, make sure to provide certificates in the config")
 	}
 
+	caCertPool, err := c.ExtractCACertPool(logger)
+	if err != nil {
+		return nil, err
+	}
+
+	return &tls.Config{
+		ClientCAs:  caCertPool,
+		ClientAuth: tls.RequireAndVerifyClientCert,
+	}, nil
+}
+
+// ExtractCACertPool return the cert pool to verify client certificates
+func (c *Config) ExtractCACertPool(logger *logrus.Logger) (*x509.CertPool, error) {
 	var caFileBytes []byte
 	var caEnv string
 	if c.UseDefaultEngCA {
@@ -209,6 +224,7 @@ func (c *Config) ExtractServiceTLSConfig(logger *logrus.Logger) (*tls.Config, er
 	if !ok {
 		return nil, fmt.Errorf("tls ca not properly loaded for %s environment", caEnv)
 	}
+
 	if c.TLS.CAFile != "" {
 		customCaFileBytes, err := os.ReadFile(c.TLS.CAFile)
 		if err != nil {
@@ -221,10 +237,7 @@ func (c *Config) ExtractServiceTLSConfig(logger *logrus.Logger) (*tls.Config, er
 		logger.ActivityLog("custom_ca_file_appened", logrus.LogInfo{"ca_file_path": c.TLS.CAFile})
 	}
 
-	return &tls.Config{
-		ClientCAs:  caCertPool,
-		ClientAuth: tls.RequireAndVerifyClientCert,
-	}, nil
+	return caCertPool, nil
 }
 
 func (c *Config) configureLogger(logger *logrus.Logger) {

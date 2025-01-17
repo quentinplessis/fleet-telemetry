@@ -3,10 +3,14 @@ package streaming
 import (
 	"context"
 	"crypto/x509"
+	"encoding/pem"
 	"fmt"
 	"net/http"
+	"net/url"
 	"sync"
 	"time"
+
+	"github.com/pkg/errors"
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
@@ -58,6 +62,8 @@ type Server struct {
 
 	registry *SocketRegistry
 
+	caCertPool *x509.CertPool
+
 	ackChan chan (*telemetry.Record)
 
 	reliableAckSources map[string]telemetry.Dispatcher
@@ -65,7 +71,6 @@ type Server struct {
 
 // InitServer initializes the main server
 func InitServer(c *config.Config, airbrakeHandler *airbrake.Handler, producerRules map[string][]telemetry.Producer, logger *logrus.Logger, registry *SocketRegistry) (*http.Server, *Server, error) {
-
 	socketServer := &Server{
 		DispatchRules:      producerRules,
 		metricsCollector:   c.MetricCollector,
@@ -75,6 +80,16 @@ func InitServer(c *config.Config, airbrakeHandler *airbrake.Handler, producerRul
 		ackChan:            c.AckChan,
 		reliableAckSources: c.ReliableAckSources,
 	}
+
+	if c.AWSALBMutualTLSPassThrough {
+		caCertPool, err := c.ExtractCACertPool(logger)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		socketServer.caCertPool = caCertPool
+	}
+
 	registerServerMetricsOnce(socketServer.metricsCollector)
 
 	mux := http.NewServeMux()
@@ -129,9 +144,11 @@ func (s *Server) ServeBinaryWs(config *config.Config) func(w http.ResponseWriter
 	return func(w http.ResponseWriter, r *http.Request) {
 		if ws := s.promoteToWebsocket(w, r); ws != nil {
 			ctx := context.WithValue(context.Background(), SocketContext, map[string]interface{}{"request": r})
-			requestIdentity, err := extractIdentityFromConnection(r)
+			requestIdentity, err := s.extractIdentity(r, config)
 			if err != nil {
 				s.logger.ErrorLog("extract_sender_id_err", err, nil)
+				ws.Close()
+				return
 			}
 
 			binarySerializer := telemetry.NewBinarySerializer(requestIdentity, s.DispatchRules, s.logger)
@@ -218,8 +235,15 @@ func (s *Server) promoteToWebsocket(w http.ResponseWriter, r *http.Request) *web
 	return ws
 }
 
-func extractIdentityFromConnection(r *http.Request) (*telemetry.RequestIdentity, error) {
-	cert, err := extractCertFromHeaders(r)
+func (s *Server) extractIdentity(r *http.Request, config *config.Config) (*telemetry.RequestIdentity, error) {
+	var cert *x509.Certificate
+	var err error
+
+	if config.AWSALBMutualTLSPassThrough {
+		cert, err = extractCertAWSALB(r, s.caCertPool)
+	} else {
+		cert, err = extractCertFromTLS(r)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -228,13 +252,51 @@ func extractIdentityFromConnection(r *http.Request) (*telemetry.RequestIdentity,
 	if err != nil {
 		return nil, fmt.Errorf("create_identity issuer: %s, common_name: %s, err: %v", cert.Issuer.CommonName, cert.Subject.CommonName, err)
 	}
+
 	return &telemetry.RequestIdentity{
 		DeviceID: deviceID,
 		SenderID: clientType + "." + deviceID,
 	}, nil
 }
 
-func extractCertFromHeaders(r *http.Request) (*x509.Certificate, error) {
+// extractCertAWSALB implements https://docs.aws.amazon.com/elasticloadbalancing/latest/application/mutual-authentication.html#mtls-http-headers
+func extractCertAWSALB(r *http.Request, caCertPool *x509.CertPool) (*x509.Certificate, error) {
+	raw := r.Header.Get("X-Amzn-Mtls-Clientcert")
+	if raw == "" {
+		return nil, errors.New("missing_certificate_error")
+	}
+	rest, err := url.PathUnescape(raw)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse certificates: %w", err)
+	}
+
+	block, _ := pem.Decode([]byte(rest))
+	if block == nil {
+		return nil, fmt.Errorf("failed to parse certificates: %w", err)
+	}
+	certs, err := x509.ParseCertificates(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse certificates: %w", err)
+	}
+
+	if len(certs) == 0 {
+		return nil, fmt.Errorf("parsed 0 certificates")
+	}
+
+	// verify the client certificate as AWS ALB in pass-through mode does not verify the client certificate
+	opts := x509.VerifyOptions{
+		Roots:     caCertPool,
+		KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	}
+
+	if _, err := certs[0].Verify(opts); err != nil {
+		return nil, fmt.Errorf("failed to verify certificate: %w", err)
+	}
+
+	return certs[0], nil
+}
+
+func extractCertFromTLS(r *http.Request) (*x509.Certificate, error) {
 	nbCerts := len(r.TLS.PeerCertificates)
 	if nbCerts == 0 {
 		return nil, fmt.Errorf("missing_certificate_error")
