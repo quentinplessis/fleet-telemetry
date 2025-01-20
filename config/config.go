@@ -225,7 +225,7 @@ func (c *Config) ExtractCACertPool(logger *logrus.Logger) (*x509.CertPool, error
 		return nil, fmt.Errorf("tls ca not properly loaded for %s environment", caEnv)
 	}
 
-	if c.TLS.CAFile != "" {
+	if c.TLS != nil && c.TLS.CAFile != "" {
 		customCaFileBytes, err := os.ReadFile(c.TLS.CAFile)
 		if err != nil {
 			return nil, err
